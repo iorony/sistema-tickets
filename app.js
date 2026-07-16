@@ -282,7 +282,7 @@ async function renderTicketDetail() {
   const id = state.currentTicketId;
 
   const [{ data: ticket, error }, { data: comments }, { data: attachments }] = await Promise.all([
-    supabase.from('tickets').select('*, groups:group_id(nombre), categories:category_id(nombre), profiles:created_by(nombre, correo)').eq('id', id).single(),
+    supabase.from('tickets').select('*, groups:group_id(nombre), categories:category_id(nombre), profiles:created_by(nombre, correo), assignee:assigned_to(id, nombre)').eq('id', id).single(),
     supabase.from('ticket_comments').select('*, profiles:author_id(nombre)').eq('ticket_id', id).order('created_at'),
     supabase.from('ticket_attachments').select('*, profiles:uploaded_by(nombre)').eq('ticket_id', id).order('created_at'),
   ]);
@@ -293,6 +293,18 @@ async function renderTicketDetail() {
   }
 
   const canManage = ['admin', 'supervisor', 'agente'].includes(state.profile.rol);
+
+  let agentOptions = '';
+  if (canManage) {
+    const { data: groupStaff } = await supabase
+      .from('group_access')
+      .select('user_id, profiles:user_id(id, nombre, rol)')
+      .eq('group_id', ticket.group_id);
+    agentOptions = (groupStaff || [])
+      .filter(gs => gs.profiles && ['agente', 'supervisor'].includes(gs.profiles.rol))
+      .map(gs => `<option value="${gs.profiles.id}" ${ticket.assigned_to === gs.profiles.id ? 'selected' : ''}>${esc(gs.profiles.nombre)} (${esc(gs.profiles.rol)})</option>`)
+      .join('');
+  }
 
   const content = `
     <div class="main-header">
@@ -351,6 +363,16 @@ async function renderTicketDetail() {
               </select>
             </div>
           ` : ''}
+          <div class="kv" style="margin-top:14px"><span class="k">Agente asignado</span>${ticket.assignee ? esc(ticket.assignee.nombre) : 'Sin asignar'}</div>
+          ${canManage ? `
+            <div class="field" style="margin-top:10px">
+              <label>Reasignar</label>
+              <select id="assignee-select">
+                <option value="">Sin asignar</option>
+                ${agentOptions}
+              </select>
+            </div>
+          ` : ''}
         </div>
       </div>
     </div>
@@ -376,6 +398,15 @@ async function renderTicketDetail() {
     if (error) { alert('No se pudo agregar el comentario: ' + error.message); return; }
     renderTicketDetail();
   });
+
+  const assigneeSelect = document.getElementById('assignee-select');
+  if (assigneeSelect) {
+    assigneeSelect.addEventListener('change', async (e) => {
+      const { error } = await supabase.from('tickets').update({ assigned_to: e.target.value || null }).eq('id', id);
+      if (error) alert('No se pudo asignar: ' + error.message);
+      else renderTicketDetail();
+    });
+  }
 
   document.getElementById('attachment-input').addEventListener('change', async (e) => {
     const file = e.target.files[0];
@@ -517,10 +548,14 @@ async function renderUsers() {
 }
 
 async function openEditUserModal(user) {
+  const isAdmin = state.profile.rol === 'admin';
   const groupOptions = state.groups.map(g => `<option value="${g.id}" ${user.group_id === g.id ? 'selected' : ''}>${esc(g.nombre)}</option>`).join('');
   const roleOptions = ['usuario', 'agente', 'supervisor', 'admin']
-    .filter(r => state.profile.rol === 'admin' || ['usuario', 'agente'].includes(r))
+    .filter(r => isAdmin || ['usuario', 'agente'].includes(r))
     .map(r => `<option value="${r}" ${user.rol === r ? 'selected' : ''}>${r}</option>`).join('');
+
+  const { data: currentAccess } = await supabase.from('group_access').select('group_id').eq('user_id', user.id);
+  const currentAccessIds = (currentAccess || []).map(a => a.group_id);
 
   showModal(`
     <h2>Editar usuario</h2>
@@ -533,9 +568,22 @@ async function openEditUserModal(user) {
         <div class="field"><label>Departamento</label><input name="departamento" value="${esc(user.departamento || '')}" /></div>
         <div class="field"><label>N/S de equipo</label><input name="ns_equipo" value="${esc(user.ns_equipo || '')}" /></div>
       </div>
-      <div class="grid-2">
-        <div class="field"><label>Rol</label><select name="rol">${roleOptions}</select></div>
-        <div class="field"><label>Grupo (solo si rol = usuario)</label><select name="group_id"><option value="">— sin grupo —</option>${groupOptions}</select></div>
+      <div class="field"><label>Rol</label><select name="rol" id="rol-select">${roleOptions}</select></div>
+      <div class="field" id="group-single-wrap">
+        <label>Grupo (usuario final — pertenece a uno solo)</label>
+        <select name="group_id"><option value="">— sin grupo —</option>${groupOptions}</select>
+      </div>
+      <div class="field" id="group-multi-wrap">
+        <label>Grupos con acceso (agente/supervisor — puede ser varios)</label>
+        ${!isAdmin ? `<p style="color:var(--text-faint);font-size:12px;margin:0 0 8px">Solo un admin puede cambiar esto.</p>` : ''}
+        <div style="display:flex;flex-direction:column;gap:7px;max-height:170px;overflow-y:auto;padding:2px">
+          ${state.groups.map(g => `
+            <label style="display:flex;align-items:center;gap:8px;font-size:13.5px;font-weight:400;text-transform:none;letter-spacing:0">
+              <input type="checkbox" name="group_access" value="${g.id}" ${currentAccessIds.includes(g.id) ? 'checked' : ''} ${!isAdmin ? 'disabled' : ''} />
+              ${esc(g.nombre)}
+            </label>
+          `).join('')}
+        </div>
       </div>
       <div class="modal-actions">
         <button type="button" class="btn btn-secondary" id="modal-cancel">Cancelar</button>
@@ -543,8 +591,21 @@ async function openEditUserModal(user) {
       </div>
     </form>
   `);
+
+  const form = document.getElementById('edit-user-form');
+  const roleSelect = document.getElementById('rol-select');
+  const singleWrap = document.getElementById('group-single-wrap');
+  const multiWrap = document.getElementById('group-multi-wrap');
+  function toggleGroupFields() {
+    const isUsuario = roleSelect.value === 'usuario';
+    singleWrap.style.display = isUsuario ? '' : 'none';
+    multiWrap.style.display = isUsuario ? 'none' : '';
+  }
+  toggleGroupFields();
+  roleSelect.addEventListener('change', toggleGroupFields);
+
   document.getElementById('modal-cancel').addEventListener('click', closeModal);
-  document.getElementById('edit-user-form').addEventListener('submit', async (e) => {
+  form.addEventListener('submit', async (e) => {
     e.preventDefault();
     const f = e.target;
     const payload = {
@@ -557,6 +618,14 @@ async function openEditUserModal(user) {
     };
     const { error } = await supabase.from('profiles').update(payload).eq('id', user.id);
     if (error) { alert('No se pudo guardar: ' + error.message); return; }
+
+    if (payload.rol !== 'usuario' && isAdmin) {
+      const checked = Array.from(f.querySelectorAll('input[name=group_access]:checked')).map(cb => cb.value);
+      await supabase.from('group_access').delete().eq('user_id', user.id);
+      if (checked.length) {
+        await supabase.from('group_access').insert(checked.map(gid => ({ user_id: user.id, group_id: gid })));
+      }
+    }
     closeModal();
     renderUsers();
   });

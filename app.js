@@ -567,7 +567,8 @@ async function renderUsers() {
               <td>${grupoDisplay}</td>
               <td style="white-space:nowrap">
                 <button class="btn btn-secondary" data-edit-user="${u.id}" style="padding:4px 10px;font-size:12px">Editar</button>
-                <button class="btn btn-secondary" data-reset-pw="${u.id}" data-email="${esc(u.correo)}" style="padding:4px 10px;font-size:12px">Restablecer contraseña</button>
+                <button class="btn btn-secondary" data-temp-pw="${u.id}" data-name="${esc(u.nombre)}" style="padding:4px 10px;font-size:12px">Contraseña temporal</button>
+                <button class="btn btn-secondary" data-reset-pw="${u.id}" data-email="${esc(u.correo)}" style="padding:4px 10px;font-size:12px">Enviar por correo</button>
               </td>
             </tr>
           `;
@@ -577,13 +578,18 @@ async function renderUsers() {
     </div>
     <p style="color:var(--text-faint);font-size:12.5px;margin-top:14px">
       Para crear un usuario nuevo: primero créalo en Supabase (Authentication → Add user), luego edítalo aquí para completar sus datos.
-      "Restablecer contraseña" envía un correo al usuario para que la defina él mismo.
+      "Contraseña temporal" te la muestra en pantalla para que se la compartas tú mismo al usuario (no depende de correo); al ingresar con ella, el sistema le pedirá cambiarla.
+      "Enviar por correo" le manda un enlace de restablecimiento a su email.
     </p>
   `;
   renderShell(content);
 
   root.querySelectorAll('[data-edit-user]').forEach(btn => {
     btn.addEventListener('click', () => openEditUserModal(users.find(u => u.id === btn.dataset.editUser)));
+  });
+
+  root.querySelectorAll('[data-temp-pw]').forEach(btn => {
+    btn.addEventListener('click', () => openTempPasswordModal(btn.dataset.tempPw, btn.dataset.name));
   });
 
   root.querySelectorAll('[data-reset-pw]').forEach(btn => {
@@ -594,6 +600,41 @@ async function renderUsers() {
       if (error) { alert('No se pudo enviar el correo: ' + error.message); return; }
       alert('Correo de restablecimiento enviado a ' + btn.dataset.email);
     });
+  });
+}
+
+function randomPassword() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
+  let pw = '';
+  for (let i = 0; i < 10; i++) pw += chars[Math.floor(Math.random() * chars.length)];
+  return pw;
+}
+
+function openTempPasswordModal(userId, userName) {
+  showModal(`
+    <h2>Contraseña temporal — ${esc(userName)}</h2>
+    <p style="color:var(--text-dim);font-size:13px;margin:-8px 0 16px">
+      Se la debes compartir tú mismo al usuario. En su próximo inicio de sesión se le pedirá cambiarla.
+    </p>
+    <form id="temp-pw-form">
+      <div class="field">
+        <label>Contraseña temporal</label>
+        <input name="password" id="temp-pw-input" value="${randomPassword()}" required minlength="6" />
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-secondary" id="modal-cancel">Cancelar</button>
+        <button type="submit" class="btn btn-primary">Definir contraseña</button>
+      </div>
+    </form>
+  `);
+  document.getElementById('modal-cancel').addEventListener('click', closeModal);
+  document.getElementById('temp-pw-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const password = e.target.password.value;
+    const { error } = await supabase.rpc('admin_set_temp_password', { target_id: userId, new_password: password });
+    if (error) { alert('No se pudo definir la contraseña: ' + error.message); return; }
+    closeModal();
+    alert(`Contraseña temporal definida para ${userName}:\n\n${password}\n\nCompártesela directamente — no se enviará por correo.`);
   });
 }
 
@@ -783,6 +824,37 @@ supabase.auth.onAuthStateChange((event, session) => {
   }
 });
 
+function renderForcedPasswordChange() {
+  root.innerHTML = `
+    <div class="login-screen">
+      <div class="login-card">
+        <div class="login-brand"><span class="dot"></span><span>Mesa de Ayuda</span></div>
+        <h1>Define tu contraseña</h1>
+        <p class="sub">Tu administrador te dio una contraseña temporal. Define una nueva antes de continuar.</p>
+        ${state.error ? `<div class="error-msg">${esc(state.error)}</div>` : ''}
+        <form id="forced-pw-form">
+          <div class="field">
+            <label for="forced-password">Nueva contraseña</label>
+            <input id="forced-password" name="password" type="password" minlength="6" required autocomplete="new-password" />
+          </div>
+          <button type="submit" class="btn btn-primary">Guardar y continuar</button>
+        </form>
+      </div>
+    </div>
+  `;
+  document.getElementById('forced-pw-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const password = e.target.password.value;
+    const { error } = await supabase.auth.updateUser({ password });
+    if (error) { state.error = error.message; renderRoot(); return; }
+    await supabase.from('profiles').update({ debe_cambiar_password: false }).eq('id', state.profile.id);
+    state.error = null;
+    state.profile.debe_cambiar_password = false;
+    state.view = 'tickets';
+    renderRoot();
+  });
+}
+
 // ============================================================
 // Root render / router
 // ============================================================
@@ -790,6 +862,7 @@ function renderRoot() {
   if (state.view === 'password-recovery') { renderPasswordRecovery(); return; }
   if (!state.session) { renderLogin(); return; }
   if (!state.profile) { root.innerHTML = `<div class="loading-line" style="padding:40px">Cargando…</div>`; return; }
+  if (state.profile.debe_cambiar_password) { renderForcedPasswordChange(); return; }
 
   if (state.view === 'tickets') renderTickets();
   else if (state.view === 'ticket-detail') renderTicketDetail();
@@ -814,6 +887,27 @@ async function bootstrapApp() {
 }
 
 async function init() {
+  // Enlace de restablecimiento de contraseña: verificamos el token nosotros
+  // mismos (en vez de que el correo apunte directo al endpoint de Supabase)
+  // para que los escáneres de seguridad de Outlook/Gmail no lo consuman antes
+  // de que el usuario le dé clic.
+  const params = new URLSearchParams(window.location.search);
+  const tokenHash = params.get('token_hash');
+  const type = params.get('type');
+  if (tokenHash && type === 'recovery') {
+    const { data, error } = await supabase.auth.verifyOtp({ token_hash: tokenHash, type: 'recovery' });
+    window.history.replaceState({}, '', window.location.pathname);
+    if (error) {
+      state.error = 'El enlace ya no es válido. Pide que te envíen uno nuevo.';
+      renderPasswordRecovery();
+      return;
+    }
+    state.session = data.session;
+    state.view = 'password-recovery';
+    renderRoot();
+    return;
+  }
+
   const { data } = await supabase.auth.getSession();
   state.session = data.session;
   if (state.session) {

@@ -509,11 +509,42 @@ async function renderCategories() {
 // ============================================================
 async function renderUsers() {
   renderShell(`<div class="loading-line">Cargando usuarios…</div>`);
-  const { data: users, error } = await supabase
-    .from('profiles')
-    .select('*, groups:group_id(nombre)')
-    .order('nombre');
-  if (error) console.error(error);
+
+  let users = [];
+  let accessMap = {};
+
+  if (state.profile.rol === 'admin') {
+    const [{ data: allUsers, error }, { data: access }] = await Promise.all([
+      supabase.from('profiles').select('*, groups:group_id(nombre)').order('nombre'),
+      supabase.from('group_access').select('user_id, groups:group_id(nombre)'),
+    ]);
+    if (error) console.error(error);
+    users = allUsers || [];
+    (access || []).forEach(a => {
+      if (!a.groups?.nombre) return;
+      if (!accessMap[a.user_id]) accessMap[a.user_id] = [];
+      accessMap[a.user_id].push(a.groups.nombre);
+    });
+  } else {
+    // Supervisor: solo usuarios y agentes de sus grupos asignados.
+    const groupIds = state.groups.map(g => g.id);
+    const [{ data: usuarios }, { data: accessRows }] = groupIds.length
+      ? await Promise.all([
+          supabase.from('profiles').select('*, groups:group_id(nombre)').eq('rol', 'usuario').in('group_id', groupIds),
+          supabase.from('group_access').select('user_id, groups:group_id(nombre), profiles:user_id(*)').in('group_id', groupIds),
+        ])
+      : [{ data: [] }, { data: [] }];
+
+    const agentMap = new Map();
+    (accessRows || []).forEach(r => {
+      if (r.profiles?.rol === 'agente') agentMap.set(r.profiles.id, r.profiles);
+      if (r.profiles && r.groups?.nombre) {
+        if (!accessMap[r.user_id]) accessMap[r.user_id] = [];
+        accessMap[r.user_id].push(r.groups.nombre);
+      }
+    });
+    users = [...(usuarios || []), ...Array.from(agentMap.values())].sort((a, b) => a.nombre.localeCompare(b.nombre));
+  }
 
   const content = `
     <div class="main-header">
@@ -521,29 +552,48 @@ async function renderUsers() {
     </div>
     <div class="card" style="padding:0">
       <table class="table">
-        <thead><tr><th>Nombre</th><th>Correo</th><th>Empresa</th><th>Rol</th><th>Grupo</th><th></th></tr></thead>
+        <thead><tr><th>Nombre</th><th>Correo</th><th>Empresa</th><th>Rol</th><th>Grupo(s)</th><th></th></tr></thead>
         <tbody>
-          ${(!users || users.length === 0) ? `<tr><td colspan="6" style="color:var(--text-faint)">Sin usuarios.</td></tr>` : users.map(u => `
+          ${(!users || users.length === 0) ? `<tr><td colspan="6" style="color:var(--text-faint)">Sin usuarios.</td></tr>` : users.map(u => {
+            const grupoDisplay = u.rol === 'usuario'
+              ? esc(u.groups?.nombre || '—')
+              : esc((accessMap[u.id] || []).join(', ') || '—');
+            return `
             <tr>
               <td>${esc(u.nombre)}</td>
               <td>${esc(u.correo)}</td>
               <td>${esc(u.empresa)}</td>
               <td><span class="tag">${esc(u.rol)}</span></td>
-              <td>${esc(u.groups?.nombre || '—')}</td>
-              <td><button class="btn btn-secondary" data-edit-user="${u.id}" style="padding:4px 10px;font-size:12px">Editar</button></td>
+              <td>${grupoDisplay}</td>
+              <td style="white-space:nowrap">
+                <button class="btn btn-secondary" data-edit-user="${u.id}" style="padding:4px 10px;font-size:12px">Editar</button>
+                <button class="btn btn-secondary" data-reset-pw="${u.id}" data-email="${esc(u.correo)}" style="padding:4px 10px;font-size:12px">Restablecer contraseña</button>
+              </td>
             </tr>
-          `).join('')}
+          `;
+          }).join('')}
         </tbody>
       </table>
     </div>
     <p style="color:var(--text-faint);font-size:12.5px;margin-top:14px">
       Para crear un usuario nuevo: primero créalo en Supabase (Authentication → Add user), luego edítalo aquí para completar sus datos.
+      "Restablecer contraseña" envía un correo al usuario para que la defina él mismo.
     </p>
   `;
   renderShell(content);
 
   root.querySelectorAll('[data-edit-user]').forEach(btn => {
     btn.addEventListener('click', () => openEditUserModal(users.find(u => u.id === btn.dataset.editUser)));
+  });
+
+  root.querySelectorAll('[data-reset-pw]').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      if (!confirm(`¿Enviar correo de restablecimiento de contraseña a ${btn.dataset.email}?`)) return;
+      const redirectTo = window.location.origin + window.location.pathname;
+      const { error } = await supabase.auth.resetPasswordForEmail(btn.dataset.email, { redirectTo });
+      if (error) { alert('No se pudo enviar el correo: ' + error.message); return; }
+      alert('Correo de restablecimiento enviado a ' + btn.dataset.email);
+    });
   });
 }
 
@@ -697,10 +747,47 @@ function closeModal() {
   if (el) el.remove();
 }
 
+function renderPasswordRecovery() {
+  root.innerHTML = `
+    <div class="login-screen">
+      <div class="login-card">
+        <div class="login-brand"><span class="dot"></span><span>Mesa de Ayuda</span></div>
+        <h1>Nueva contraseña</h1>
+        <p class="sub">Define tu nueva contraseña para continuar.</p>
+        ${state.error ? `<div class="error-msg">${esc(state.error)}</div>` : ''}
+        <form id="recovery-form">
+          <div class="field">
+            <label for="new-password">Nueva contraseña</label>
+            <input id="new-password" name="password" type="password" minlength="6" required autocomplete="new-password" />
+          </div>
+          <button type="submit" class="btn btn-primary">Guardar contraseña</button>
+        </form>
+      </div>
+    </div>
+  `;
+  document.getElementById('recovery-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const password = e.target.password.value;
+    const { error } = await supabase.auth.updateUser({ password });
+    if (error) { state.error = error.message; renderRoot(); return; }
+    state.error = null;
+    await bootstrapApp();
+  });
+}
+
+supabase.auth.onAuthStateChange((event, session) => {
+  if (event === 'PASSWORD_RECOVERY') {
+    state.session = session;
+    state.view = 'password-recovery';
+    renderRoot();
+  }
+});
+
 // ============================================================
 // Root render / router
 // ============================================================
 function renderRoot() {
+  if (state.view === 'password-recovery') { renderPasswordRecovery(); return; }
   if (!state.session) { renderLogin(); return; }
   if (!state.profile) { root.innerHTML = `<div class="loading-line" style="padding:40px">Cargando…</div>`; return; }
 

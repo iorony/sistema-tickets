@@ -621,9 +621,11 @@ async function openEditUserModal(user) {
 
     if (payload.rol !== 'usuario' && isAdmin) {
       const checked = Array.from(f.querySelectorAll('input[name=group_access]:checked')).map(cb => cb.value);
-      await supabase.from('group_access').delete().eq('user_id', user.id);
+      const { error: delErr } = await supabase.from('group_access').delete().eq('user_id', user.id);
+      if (delErr) { alert('No se pudo actualizar el acceso a grupos (borrado): ' + delErr.message); return; }
       if (checked.length) {
-        await supabase.from('group_access').insert(checked.map(gid => ({ user_id: user.id, group_id: gid })));
+        const { error: insErr } = await supabase.from('group_access').insert(checked.map(gid => ({ user_id: user.id, group_id: gid })));
+        if (insErr) { alert('No se pudo actualizar el acceso a grupos (inserción): ' + insErr.message); return; }
       }
     }
     closeModal();
